@@ -237,7 +237,9 @@ $('joinForm').addEventListener('submit', async (e) => {
 
 function setPeer(p) {
   state.peer = p;
-  $('peerStatus').textContent = p ? `With ${p.name} (${p.provider})` : 'Waiting for someone to join...';
+  // A "join" message carries no provider; the next poll fills it in from r.peers.
+  $('peerStatus').textContent = !p ? 'Waiting for someone to join...'
+    : p.provider ? `With ${p.name} (${p.provider})` : `With ${p.name}`;
 }
 
 function startPolling() {
@@ -249,6 +251,10 @@ function startPolling() {
     if (r.ok) {
       state.since = r.seq;
       for (const m of r.messages) await onMessage(m);
+      if (state.peer && !state.peer.provider && Array.isArray(r.peers)) {
+        const p = r.peers.find((x) => x.sid === state.peer.sid);
+        if (p) setPeer(p);
+      }
     } else if (r.status === 401 || r.status === 403) {
       sysChat('Disconnected from the room: ' + r.error);
       await endCall(false);
