@@ -12,8 +12,8 @@ Read `AGENTS.md`, `docs/decisions.md`, `docs/bsl-findings.md`. The client (`publ
 
 ## Steps
 
-1. Setup as in `AGENTS.md` (port 3001, `devLogin: 1`). Start the server.
-2. Open `http://localhost:3001` in two isolated sessions (normal + incognito, or two browsers). Allow camera/mic if asked. If there is no camera, the test pattern is fine; say so in the report.
+1. Setup as in `AGENTS.md` (port 3002, `devLogin: 1`). Start the server.
+2. Open `http://localhost:3002` in two isolated sessions (normal + incognito, or two browsers). Allow camera/mic if asked. If there is no camera, the test pattern is fine; say so in the report.
 3. Window A: dev login "Alice", join room `lab3`. Window B: dev login "Bob", join `lab3`.
 4. Check and screenshot (save to `docs/screenshots/`):
    - both windows show the remote video; the state pill says `connected`;
@@ -23,7 +23,7 @@ Read `AGENTS.md`, `docs/decisions.md`, `docs/bsl-findings.md`. The client (`publ
    - Hang up in A: B shows "Alice left (hang up)", and A returns to the lobby. A rejoins: the call reconnects.
    - Close B's tab without hanging up: within ~15 s A shows "Bob left (timeout)".
 5. Read the browser console in every window. Fix client bugs you find, in your files only. If the bug is in the server, describe it in the report (exact request + response) and don't edit `server.bzg`.
-6. Re-run `BASE=http://localhost:3001 bash tests/api_test.sh` after your changes; it must still pass.
+6. Re-run `BASE=http://localhost:3002 bash tests/api_test.sh` after your changes; it must still pass.
 
 ## Report format
 
