@@ -5,8 +5,8 @@ Integrator: Claude (this folder's main session). Owner: you. Agents work on thei
 | Task | File | Branch | Owns | Wave | Status |
 |---|---|---|---|---|---|
 | 1. Server passes API test (fix segfault) | `task-1-server-stability.md` | `agent/server-stability` | `server.bzg`, `tests/api_test.sh` | 1 | **done**, merged into main 2026-11-24 (29/29 on BSL 1.3.4, report in `docs/agent-reports/`) |
-| 3. README, GAPS, TESTING | `task-3-docs.md` | `agent/docs` | `README.md`, `GAPS.md`, `TESTING.md` | 1 | ready (not started) |
-| 2. Two-window browser call + chat | `task-2-browser-call.md` | `agent/browser-call` | `public/*`, `docs/screenshots/` | 2 (after Task 1 merged) | ready. Note: Task 1 changed `public/app.js` (`kind` field, URI-encoded chat); review it. |
+| 3. README, GAPS, TESTING | `task-3-docs.md` | `agent/docs` | `README.md`, `GAPS.md`, `TESTING.md` | 1 | **done**, merged 2026-11-24 |
+| 2. Two-window browser call + chat | `task-2-browser-call.md` | `agent/browser-call` | `public/*`, `docs/screenshots/` | 2 (after Task 1 merged) | **done**, merged 2026-11-24 (dev login + test pattern; real camera not yet tested) |
 
 Tasks 1 and 3 touch different files and can run at the same time. Task 2 needs a working server.
 
