@@ -261,7 +261,9 @@ function startPolling() {
 
 async function onMessage(m) {
   if (m.type === 'chat') {
-    addChat(m.name, m.data, false, false);
+    let text = m.data;
+    try { text = decodeURIComponent(m.data); } catch (e) { /* show as received */ }
+    addChat(m.name, text, false, false);
   } else if (m.type === 'join') {
     sysChat(`${m.name} joined.`);
     setPeer({ sid: m.from, name: m.name, provider: '' });
@@ -410,7 +412,7 @@ function sendSignal(obj) {
   sendQueue = sendQueue.then(async () => {
     for (let i = 0; i < n; i++) {
       const c = text.slice(i * CHUNK, (i + 1) * CHUNK);
-      const r = await api('POST', '/send', { room: state.room, type: 'signal', data: { id, i, n, c } });
+      const r = await api('POST', '/send', { room: state.room, kind: 'signal', data: { id, i, n, c } });
       if (!r.ok) console.warn('signal send failed', r.error);
     }
   });
@@ -463,8 +465,14 @@ $('chatForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = $('chatInput').value.trim();
   if (!text) return;
+  // URI-encode so the BSL server only sees ASCII (its JSON parser breaks emoji).
+  const data = encodeURIComponent(text);
+  if (data.length > 2000) {
+    sysChat('Message too long (emoji count extra). Please shorten it.');
+    return;
+  }
   $('chatInput').value = '';
-  const r = await api('POST', '/send', { room: state.room, type: 'chat', data: text });
+  const r = await api('POST', '/send', { room: state.room, kind: 'chat', data });
   if (r.ok) addChat(state.me.name, text, true, false);
   else sysChat('Message not sent: ' + r.error);
 });

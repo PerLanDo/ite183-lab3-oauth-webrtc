@@ -164,12 +164,17 @@ function respond(c, status, ctype, body) {
     writeAll(c, body);
 }
 
+// BSL's garbage collector can free a temporary that only lives inside a call's
+// argument list (the server segfaulted after ~30-50 polls). Callers build reply
+// objects in locals, and the serialized text is held in a local here too.
 function json(c, status, obj) {
-    respond(c, status, "application/json; charset=utf-8", stringifyJSON(obj));
+    var text = stringifyJSON(obj);
+    respond(c, status, "application/json; charset=utf-8", text);
 }
 
 function fail(c, status, msg) {
-    json(c, status, {ok: 0, error: msg});
+    var reply = {ok: 0, error: msg};
+    json(c, status, reply);
 }
 
 function serveFile(c, file, ctype) {
@@ -202,15 +207,18 @@ function authSession(head) {
 }
 
 function createSession(provider, name, email, verified) {
+    var token = newToken();
+    var sid = "p" + rand.randint(100000000, 999999999);
+    var now = millis();
     var s = {
-        token: newToken(),
-        sid: "p" + rand.randint(100000000, 999999999),
+        token: token,
+        sid: sid,
         name: name,
         provider: provider,
         email: email,
         verified: verified,
         room: "",
-        lastSeen: millis()
+        lastSeen: now
     };
     sessions[sizeof(sessions)] = s;
     print("[auth] " + provider + " sign-in: " + name + " (" + s.sid + ")\n");
@@ -234,7 +242,9 @@ function cleanName(n) {
 // ---------------------------------------------------------------- rooms & messages
 function pushMessage(room, from, name, type, data) {
     seq = seq + 1;
-    messages[sizeof(messages)] = {seq: seq, room: room, from: from, name: name, type: type, data: data, t: millis()};
+    var now = millis();
+    var msg = {seq: seq, room: room, from: from, name: name, type: type, data: data, t: now};
+    messages[sizeof(messages)] = msg;
     if (sizeof(messages) > MAX_MESSAGES) {
         var keep = [];
         for (var i = sizeof(messages) - int(MAX_MESSAGES / 2); i < sizeof(messages); i = i + 1) {
@@ -252,6 +262,20 @@ function roomPeers(room) {
         }
     }
     return list;
+}
+
+// Reply helpers. Defined after publicMe() and roomPeers(): BSL has no hoisting.
+function signedIn(c, s) {
+    var me = publicMe(s);
+    var reply = {ok: 1, token: s.token, me: me};
+    json(c, "200 OK", reply);
+}
+
+function joinedReply(c, s, room, since) {
+    var me = publicMe(s);
+    var peers = roomPeers(room);
+    var reply = {ok: 1, me: me, peers: peers, since: since};
+    json(c, "200 OK", reply);
 }
 
 function leaveRoom(s, reason) {
@@ -307,6 +331,24 @@ function tryBody(s, nonce) {
         return o;
     }
     return null;
+}
+
+// The nonce inside s when s is a complete JSON object (whatever the header
+// says), else "".
+function bodyNonce(s) {
+    var n = sizeof(s);
+    if (n < 2) {
+        return "";
+    }
+    if (s[0] != "{" || s[n - 1] != "}") {
+        return "";
+    }
+    var o = parseJSON(s);
+    if (isObject(o) == 0) {
+        return "";
+    }
+    var bn = "" + o.nonce;
+    return bn;
 }
 
 // ---------------------------------------------------------------- auth providers
@@ -369,7 +411,7 @@ function googleSignIn(c, body) {
         name = p.name;
     }
     var s = createSession("google", cleanName(name), p.email, 0);
-    json(c, "200 OK", {ok: 1, token: s.token, me: publicMe(s)});
+    signedIn(c, s);
 }
 
 function facebookSignIn(c, body) {
@@ -384,7 +426,7 @@ function facebookSignIn(c, body) {
     // The access token cannot be checked against graph.facebook.com: no HTTPS
     // client in strict BSL. The name is trusted as sent (see GAPS.md).
     var s = createSession("facebook", cleanName(body.name), "", 0);
-    json(c, "200 OK", {ok: 1, token: s.token, me: publicMe(s)});
+    signedIn(c, s);
 }
 
 function devSignIn(c, body) {
@@ -393,7 +435,7 @@ function devSignIn(c, body) {
         return;
     }
     var s = createSession("dev", cleanName(body.name), "", 0);
-    json(c, "200 OK", {ok: 1, token: s.token, me: publicMe(s)});
+    signedIn(c, s);
 }
 
 // ---------------------------------------------------------------- room endpoints
@@ -404,7 +446,7 @@ function joinRoom(c, s, body) {
         return;
     }
     if (s.room == room) {
-        json(c, "200 OK", {ok: 1, me: publicMe(s), peers: roomPeers(room), since: seq});
+        joinedReply(c, s, room, seq);
         return;
     }
     leaveRoom(s, "switched room");
@@ -418,7 +460,7 @@ function joinRoom(c, s, body) {
     s.lastSeen = millis();
     pushMessage(room, s.sid, s.name, "join", "");
     print("[room] " + s.name + " joined '" + room + "'\n");
-    json(c, "200 OK", {ok: 1, me: publicMe(s), peers: roomPeers(room), since: since});
+    joinedReply(c, s, room, since);
 }
 
 function sendMessage(c, s, body) {
@@ -426,22 +468,25 @@ function sendMessage(c, s, body) {
         fail(c, "403 Forbidden", "join the room first");
         return;
     }
-    var type = body.type;
-    if (type == "chat") {
+    // The request field is "kind", not "type": in BSL, x.type is built in and
+    // always returns the value's type name ("object"), never the JSON field.
+    var kind = body.kind;
+    if (kind == "chat") {
         var text = body.data;
         if (sizeof(text) == 0 || sizeof(text) > 2000) {
             fail(c, "400 Bad Request", "chat text must be 1-2000 bytes");
             return;
         }
         pushMessage(s.room, s.sid, s.name, "chat", text);
-    } else if (type == "signal") {
+    } else if (kind == "signal") {
         pushMessage(s.room, s.sid, s.name, "signal", body.data);
     } else {
         fail(c, "400 Bad Request", "unknown message type");
         return;
     }
     s.lastSeen = millis();
-    json(c, "200 OK", {ok: 1, seq: seq});
+    var sent = {ok: 1, seq: seq};
+    json(c, "200 OK", sent);
 }
 
 function poll(c, s, path) {
@@ -466,7 +511,10 @@ function poll(c, s, path) {
     if (sizeof(out) == 60) {
         last = out[59].seq;
     }
-    json(c, "200 OK", {ok: 1, seq: last, messages: out, peers: roomPeers(room)});
+    // Keep every temporary in a local (see json()).
+    var peers = roomPeers(room);
+    var reply = {ok: 1, seq: last, messages: out, peers: peers};
+    json(c, "200 OK", reply);
 }
 
 // ---------------------------------------------------------------- router
@@ -504,12 +552,13 @@ function handle(c) {
         } else if (route == "/style.css") {
             serveFile(c, "public/style.css", "text/css; charset=utf-8");
         } else if (route == "/config") {
-            json(c, "200 OK", {
+            var pub = {
                 googleClientId: CONFIG.googleClientId,
                 facebookAppId: CONFIG.facebookAppId,
                 githubAvailable: 0,
                 devLogin: CONFIG.devLogin
-            });
+            };
+            json(c, "200 OK", pub);
         } else if (route == "/auth/github") {
             respond(c, "501 Not Implemented", "text/plain; charset=utf-8",
                 "GitHub sign-in is not available in strict BSL: the OAuth code exchange needs an HTTPS client and the client secret on the server. See GAPS.md.");
@@ -518,7 +567,9 @@ function handle(c) {
             if (isObject(sm) == 0) {
                 fail(c, "401 Unauthorized", "not signed in");
             } else {
-                json(c, "200 OK", {ok: 1, me: publicMe(sm)});
+                var meObj = publicMe(sm);
+                var meReply = {ok: 1, me: meObj};
+                json(c, "200 OK", meReply);
             }
         } else if (route == "/poll") {
             var sp = authSession(head);
@@ -551,9 +602,25 @@ function handle(c) {
         fail(c, "400 Bad Request", "missing X-Nonce header");
         return;
     }
-    var body = tryBody(substr(d, he + 4, cl), nonce);
+    var first = substr(d, he + 4, cl);
+    var body = tryBody(first, nonce);
     if (isObject(body) == 0) {
-        // The body arrived in a second TCP segment: read once more.
+        // A complete JSON object after the headers but with the wrong nonce is
+        // either (a) the real body with a bad nonce, or (b) stale bytes: the
+        // previous request's body left in BSL's reused recv buffer, while the
+        // real body is still in flight. In (b) its nonce was already used.
+        // seenNonce() records the nonce, so a resend of (a) also counts as (b).
+        var bn = bodyNonce(first);
+        if (sizeof(bn) > 0) {
+            if (seenNonce(bn) == 0) {
+                // (a): reject now, a second read would block until the client gives up.
+                fail(c, "400 Bad Request", "body does not match X-Nonce");
+                return;
+            }
+        }
+        // The body arrived in a second TCP segment. The length of the first
+        // read can't show this (stale bytes pad it), but recv() writes the new
+        // segment at the start of the reused buffer, so the body is at offset 0.
         var d2 = socket_read(c, 65536);
         body = tryBody(substr(d2, 0, cl), nonce);
     }
@@ -590,11 +657,13 @@ function handle(c) {
         sendMessage(c, s, body);
     } else if (route == "/leave") {
         leaveRoom(s, "hang up");
-        json(c, "200 OK", {ok: 1});
+        var okReply = {ok: 1};
+        json(c, "200 OK", okReply);
     } else if (route == "/logout") {
         leaveRoom(s, "signed out");
         s.token = "x";
-        json(c, "200 OK", {ok: 1});
+        var okReply = {ok: 1};
+        json(c, "200 OK", okReply);
     } else {
         fail(c, "404 Not Found", "unknown endpoint");
     }
