@@ -76,8 +76,8 @@ check "Carol (r2) sees no r1 messages" "$([ "$(echo "$PC" | jget "messages.filte
 check "Carol cannot poll r1" $(get $C "/poll?room=r1&since=0" | grep -q 'not in this room' && echo 1)
 # Duplicate nonce replay
 n=dupnonce12345
-r1=$(curl -s -X POST -H "X-Nonce: $n" -H "Authorization: Bearer $A" --data-binary "{\"room\":\"r1\",\"kind\":\"chat\",\"data\":\"once\",\"nonce\":\"$n\"}" $B/send)
-r2=$(curl -s -X POST -H "X-Nonce: $n" -H "Authorization: Bearer $A" --data-binary "{\"room\":\"r1\",\"kind\":\"chat\",\"data\":\"once\",\"nonce\":\"$n\"}" $B/send)
+r1=$(curl -s -m 5 -X POST -H "X-Nonce: $n" -H "Authorization: Bearer $A" --data-binary "{\"room\":\"r1\",\"kind\":\"chat\",\"data\":\"once\",\"nonce\":\"$n\"}" $B/send)
+r2=$(curl -s -m 5 -X POST -H "X-Nonce: $n" -H "Authorization: Bearer $A" --data-binary "{\"room\":\"r1\",\"kind\":\"chat\",\"data\":\"once\",\"nonce\":\"$n\"}" $B/send)
 check "replayed nonce rejected" $(echo "$r2" | grep -q duplicate && echo 1) "$r1 / $r2"
 check "nonce mismatch rejected" $(curl -s -m 5 -X POST -H "X-Nonce: abcdefgh1" -H "Authorization: Bearer $A" --data-binary '{"room":"r1","kind":"chat","data":"x","nonce":"zzzzzzzz9"}' $B/send | grep -q 'X-Nonce' && echo 1)
 # A signal chunk the size the browser sends

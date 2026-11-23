@@ -13,6 +13,7 @@ Started by the Task 1 agent, finished by the integrator (Claude, main session) a
 | 3 | Emoji arrive as invalid UTF-8 | BSL turns surrogate pairs (`😀`) into CESU-8. | `public/app.js` sends chat as `encodeURIComponent(text)` and decodes it on receive. Encoded text is limited to 2000 characters. |
 | 4 | A body whose `nonce` doesn't match `X-Nonce` makes the server wait about 5 s | It fell through to a second `socket_read`, which blocks (no timeouts in BSL). | New `bodyNonce()` (after `tryBody()`): a complete JSON body whose nonce the server has never seen is rejected at once with 400. Only an incomplete body triggers the second read, which is parsed from offset 0. |
 | 4b | About 1 in 70 same-size sends (900-char signal chunks) rejected with "body does not match X-Nonce" | When the headers arrive in their own TCP segment, the reused recv buffer still holds the previous request's body right after them. With same-length requests that leftover is a complete JSON object with an old nonce, so fix 4 rejected it as a mismatch. | A complete body whose nonce was already used (`seenNonce()` returns 1) is treated as stale bytes, and the server does the second read. 100 of 100 sends passed afterwards. |
+| 4c | On BSL 1.3.4, about 1 in 50 sends rejected with "body does not match X-Nonce" even though the body was this request's own | Same GC bug as #1: the `X-Nonce` value returned by `getHeader()` came back as garbage bytes. `getHeader()` returned `substr(...)` directly and built its search keys inside `indexOf(...)` arguments. | `getHeader()`, `authSession()` and the `Content-Length` parse hold every intermediate string in a local. 120 of 120 sends then passed on 1.3.4. |
 | 5 | (Agent's draft) retry guard `sizeof(bodyText) < cl` | Stale trailing bytes in BSL's reused recv buffer pad the length, so split bodies (large Google credentials) would never be re-read. | Replaced by fix 4. |
 | 6 | "Undefined variable publicMe" after adding helpers | BSL has no function hoisting. | Helpers are defined after their dependencies (`publicMe`, `roomPeers`). |
 
@@ -46,6 +47,14 @@ EXTRA fail=0
 alive:200
 ```
 
+After upgrading to BSL v1.3.4 (build v1.3.4a, x86 installer from the Microsoft Store) and applying fix 4c, three more fresh-server runs:
+
+```
+== run 1 (1.3.4)  RESULT pass=29 fail=0  EXTRA fail=0  alive:200  (idle stall ~6s)
+== run 2 (1.3.4)  RESULT pass=29 fail=0  EXTRA fail=0  alive:200  (idle stall ~5s)
+== run 3 (1.3.4)  RESULT pass=29 fail=0  EXTRA fail=0  alive:200  (idle stall ~5s)
+```
+
 Also: 300 polls in a row (before fix 1 it crashed after 30–50), and 100 of 100 900-char signal sends (before fix 4b about 1 in 70 failed).
 
 ## New BSL facts (to add to docs/bsl-findings.md)
@@ -56,7 +65,11 @@ Also: 300 polls in a row (before fix 1 it crashed after 30–50), and 100 of 100
 - `toHex()` is not a global.
 - On Windows, two processes can bind the same port, so requests may go to either. Check `netstat -ano` before testing.
 
+- 1.3.4 triggers the GC bug more often than 1.3.3: code that passed 100/100 sends on 1.3.3 failed about 1 in 50 on 1.3.4.
+- On Windows, `timeout` (Git Bash) can't always stop a bonezegei process that is blocked in accept/read; test scripts use `timeout -k 5`.
+
 ## Not checked / open
+- In one 200-send run on 1.3.4 (before fix 4c was confirmed), one send got no reply and that server process hung and ignored SIGTERM. It did not happen again in about 120 sends plus three full runs. Not reproduced, cause unknown.
 - No real-browser test yet (that is Task 2).
 - An idle client that opens a connection and sends nothing blocks the server for about 5 s, because BSL's `socket_read` has no timeout. This is a documented BSL limit; no fix is possible in strict BSL.
 - `public/app.js` was edited outside Task 1's file ownership (the `kind` rename and URI-encoded chat), because the server fix needs it. Task 2 should review it.

@@ -72,11 +72,16 @@ function indexOf(s, sub, from) {
     return -1;
 }
 
+// Every intermediate string is held in a local: a temporary built inside a
+// call's arguments, or returned straight from substr(), can be freed early by
+// BSL's GC (the X-Nonce value came back as garbage bytes about 1 in 50 requests).
 function getHeader(head, name, lower) {
-    var p = indexOf(head, "\r\n" + name + ":", 0);
+    var key = "\r\n" + name + ":";
+    var p = indexOf(head, key, 0);
     var nlen = sizeof(name);
     if (p < 0) {
-        p = indexOf(head, "\r\n" + lower + ":", 0);
+        var lkey = "\r\n" + lower + ":";
+        p = indexOf(head, lkey, 0);
     }
     if (p < 0) {
         return "";
@@ -92,7 +97,8 @@ function getHeader(head, name, lower) {
     var n = sizeof(v);
     while (k < n) {
         if (v[k] != " ") {
-            return substr(v, k, n - k);
+            var trimmed = substr(v, k, n - k);
+            return trimmed;
         }
         k = k + 1;
     }
@@ -200,10 +206,13 @@ function authSession(head) {
     if (sizeof(a) < 8) {
         return null;
     }
-    if (substr(a, 0, 7) != "Bearer ") {
+    var scheme = substr(a, 0, 7);
+    if (scheme != "Bearer ") {
         return null;
     }
-    return findSession(substr(a, 7, sizeof(a) - 7));
+    var token = substr(a, 7, sizeof(a) - 7);
+    var s = findSession(token);
+    return s;
 }
 
 function createSession(provider, name, email, verified) {
@@ -592,7 +601,8 @@ function handle(c) {
     }
 
     // ---- POST: read and validate the JSON body
-    var cl = parseInt(getHeader(head, "Content-Length", "content-length"));
+    var clText = getHeader(head, "Content-Length", "content-length");
+    var cl = parseInt(clText);
     if (cl <= 0 || cl > MAX_BODY) {
         fail(c, "413 Payload Too Large", "body must be 1-" + MAX_BODY + " bytes");
         return;
