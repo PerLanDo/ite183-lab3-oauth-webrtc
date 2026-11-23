@@ -1,0 +1,5 @@
+# local secrets / settings
+config.json
+# installed with "bzg install"
+lib/
+*.log

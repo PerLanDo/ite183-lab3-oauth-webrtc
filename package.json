@@ -1,0 +1,16 @@
+{
+  "name": "ite183-lab3-oauth-webrtc",
+  "version": "1.0.0",
+  "description": "ITE183 Lab 3: sign-in + WebRTC video call + room chat, server in Bonezegei Scripting Language",
+  "main": "server.bzg",
+  "scripts": {
+    "start": "bonezegei server.bzg"
+  },
+  "dependencies": {
+    "socket": "^1.0.0",
+    "base64": "^1.0.0",
+    "time": "^1.0.0",
+    "rng": "^1.0.0"
+  },
+  "license": "MIT"
+}

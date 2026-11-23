@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BSL Video Call</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">BSL Video Call <span class="tag">ITE183 Lab 3</span></div>
+    <div id="userbar" class="userbar hidden">
+      <span id="whoami"></span>
+      <button id="logoutBtn" class="ghost">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Sign-in -->
+    <section id="loginView" class="card narrow">
+      <h1>Sign in</h1>
+      <p class="muted">Sign in to join a room. Each browser tab keeps its own session.</p>
+
+      <div class="provider">
+        <h2>Google</h2>
+        <div id="googleBtn"></div>
+        <p id="googleNote" class="note"></p>
+      </div>
+
+      <div class="provider">
+        <h2>Facebook</h2>
+        <button id="fbBtn" class="fb" disabled>Continue with Facebook</button>
+        <p id="fbNote" class="note"></p>
+      </div>
+
+      <div class="provider">
+        <h2>GitHub</h2>
+        <button id="ghBtn" class="gh" disabled>Continue with GitHub</button>
+        <p class="note">Not available: GitHub needs a server-side HTTPS code exchange with the client secret, which strict BSL cannot do. See GAPS.md.</p>
+      </div>
+
+      <div id="devBox" class="provider hidden">
+        <h2>Dev login <span class="tag warn">local testing only</span></h2>
+        <form id="devForm" class="row">
+          <input id="devName" maxlength="40" placeholder="Display name" required>
+          <button type="submit">Sign in</button>
+        </form>
+        <p class="note">Enabled by <code>"devLogin": 1</code> in config.json. Turn it off for the real demo.</p>
+      </div>
+
+      <p id="loginError" class="error"></p>
+    </section>
+
+    <!-- Lobby -->
+    <section id="lobbyView" class="card narrow hidden">
+      <h1>Join a room</h1>
+      <p class="muted">Two people in the same room get a 1:1 call and a shared chat.</p>
+      <form id="joinForm" class="row">
+        <input id="roomInput" maxlength="32" pattern="[A-Za-z0-9_\-]{1,32}" placeholder="room name, e.g. ite183" required>
+        <button type="submit">Join</button>
+      </form>
+      <p id="joinError" class="error"></p>
+    </section>
+
+    <!-- Call -->
+    <section id="callView" class="call hidden">
+      <div class="stage">
+        <div class="stagebar">
+          <span>Room <strong id="roomName"></strong></span>
+          <span id="peerStatus" class="pill">Waiting for someone to join...</span>
+          <span id="connState" class="pill subtle">idle</span>
+        </div>
+        <div class="videos">
+          <video id="remoteVideo" autoplay playsinline></video>
+          <video id="localVideo" autoplay playsinline muted></video>
+          <p id="mediaNote" class="medianote hidden"></p>
+        </div>
+        <div class="controls">
+          <button id="muteBtn">Mute</button>
+          <button id="camBtn">Camera off</button>
+          <button id="hangupBtn" class="danger">Hang up</button>
+        </div>
+      </div>
+      <aside class="chat">
+        <h2>Chat</h2>
+        <ol id="chatLog" class="chatlog" aria-live="polite"></ol>
+        <form id="chatForm" class="row">
+          <input id="chatInput" maxlength="500" placeholder="Type a message" autocomplete="off">
+          <button type="submit">Send</button>
+        </form>
+      </aside>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

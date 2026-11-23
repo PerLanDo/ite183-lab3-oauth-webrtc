@@ -1,0 +1,625 @@
+// ITE183 Lab 3 - Sign-in + WebRTC video call + room chat
+// Server written in Bonezegei Scripting Language (BSL), on BSL_Socket (TCP).
+//
+// One connection at a time: accept, read the request, answer, close.
+// Signaling and chat use short polling (POST /send, GET /poll), not WebSocket.
+//
+// BSL limits this file works around (measured, see GAPS.md):
+//   * socket_read() does a single recv() into a reused buffer and returns the
+//     bytes up to the old terminator, so stale bytes from an earlier request can
+//     follow the current one. Requests are cut at the first CRLFCRLF and by
+//     Content-Length, and every POST body must echo the X-Nonce header.
+//   * String "+" truncates near 8 KB and crashes on larger operands, so large
+//     bodies are never concatenated; they are written in 4 KB slices.
+//   * parseJSON() rejects strings longer than about 4 KB, so the browser splits
+//     SDP into small chunks before sending.
+
+include("lib/socket.bzg");
+include("lib/base64.bzg");
+include("lib/time.bzg");
+include("lib/rng.bzg");
+
+var PORT = 3000;
+var MAX_BODY = 4000;
+var PEER_TIMEOUT_MS = 15000;
+var MAX_MESSAGES = 800;
+var MAX_ROOM_SIZE = 2;
+var ROOM_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+
+var clock = time();
+var rand = rng();
+rand.seed(millis() + int(clock.now()));
+var b64 = base64();
+
+// In BSL an object compares equal to 0, so "x == 0" cannot detect a failed
+// loadJSON/parseJSON. Serialize and look at the first character instead.
+function isObject(x) {
+    var s = stringifyJSON(x);
+    if (s[0] == "{") {
+        return 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- config
+var CONFIG = loadJSON("config.json");
+if (isObject(CONFIG) == 0) {
+    print("config.json not found. Copy config.example.json to config.json first.\n");
+    CONFIG = {googleClientId: "", facebookAppId: "", devLogin: 0, port: 3000};
+}
+if (CONFIG.port > 0) {
+    PORT = CONFIG.port;
+}
+
+// ---------------------------------------------------------------- state
+var sessions = [];      // {token, sid, name, provider, email, verified, room, lastSeen}
+var messages = [];      // {seq, room, from, name, type, data, t}
+var seq = 0;
+var recentNonces = [];
+
+// ---------------------------------------------------------------- string helpers
+function indexOf(s, sub, from) {
+    var n = sizeof(s);
+    var m = sizeof(sub);
+    var first = sub[0];
+    for (var i = from; i <= n - m; i = i + 1) {
+        if (s[i] == first) {
+            if (substr(s, i, m) == sub) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+function getHeader(head, name, lower) {
+    var p = indexOf(head, "\r\n" + name + ":", 0);
+    var nlen = sizeof(name);
+    if (p < 0) {
+        p = indexOf(head, "\r\n" + lower + ":", 0);
+    }
+    if (p < 0) {
+        return "";
+    }
+    var start = p + 3 + nlen;
+    var end = indexOf(head, "\r\n", start);
+    if (end < 0) {
+        return "";
+    }
+    var v = substr(head, start, end - start);
+    // trim leading spaces (BSL "&&" does not short-circuit, so test length first)
+    var k = 0;
+    var n = sizeof(v);
+    while (k < n) {
+        if (v[k] != " ") {
+            return substr(v, k, n - k);
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
+function queryParam(path, key) {
+    var q = indexOf(path, "?", 0);
+    if (q < 0) {
+        return "";
+    }
+    var qs = "&" + substr(path, q + 1, sizeof(path) - q - 1);
+    var p = indexOf(qs, "&" + key + "=", 0);
+    if (p < 0) {
+        return "";
+    }
+    var start = p + sizeof(key) + 2;
+    var end = indexOf(qs, "&", start);
+    if (end < 0) {
+        end = sizeof(qs);
+    }
+    return substr(qs, start, end - start);
+}
+
+function validRoom(r) {
+    var n = sizeof(r);
+    if (n < 1 || n > 32) {
+        return 0;
+    }
+    for (var i = 0; i < n; i = i + 1) {
+        if (indexOf(ROOM_CHARS, r[i], 0) < 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+function newToken() {
+    var t = "";
+    for (var i = 0; i < 4; i = i + 1) {
+        t = t + rand.randint(100000000, 999999999);
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------- HTTP output
+function writeAll(c, data) {
+    var total = sizeof(data);
+    var off = 0;
+    while (off < total) {
+        var len = 4096;
+        if (total - off < len) {
+            len = total - off;
+        }
+        socket_write(c, substr(data, off, len), len);
+        off = off + len;
+    }
+}
+
+function respond(c, status, ctype, body) {
+    var head = "HTTP/1.1 " + status + "\r\n"
+             + "Content-Type: " + ctype + "\r\n"
+             + "Content-Length: " + sizeof(body) + "\r\n"
+             + "Cache-Control: no-store\r\n"
+             + "X-Content-Type-Options: nosniff\r\n"
+             + "Referrer-Policy: no-referrer-when-downgrade\r\n"
+             + "Connection: close\r\n\r\n";
+    socket_write(c, head, sizeof(head));
+    writeAll(c, body);
+}
+
+function json(c, status, obj) {
+    respond(c, status, "application/json; charset=utf-8", stringifyJSON(obj));
+}
+
+function fail(c, status, msg) {
+    json(c, status, {ok: 0, error: msg});
+}
+
+function serveFile(c, file, ctype) {
+    var data = readFile(file);
+    respond(c, "200 OK", ctype, data);
+}
+
+// ---------------------------------------------------------------- sessions
+function findSession(token) {
+    if (sizeof(token) < 16) {
+        return null;
+    }
+    for (var i = 0; i < sizeof(sessions); i = i + 1) {
+        if (sessions[i].token == token) {
+            return sessions[i];
+        }
+    }
+    return null;
+}
+
+function authSession(head) {
+    var a = getHeader(head, "Authorization", "authorization");
+    if (sizeof(a) < 8) {
+        return null;
+    }
+    if (substr(a, 0, 7) != "Bearer ") {
+        return null;
+    }
+    return findSession(substr(a, 7, sizeof(a) - 7));
+}
+
+function createSession(provider, name, email, verified) {
+    var s = {
+        token: newToken(),
+        sid: "p" + rand.randint(100000000, 999999999),
+        name: name,
+        provider: provider,
+        email: email,
+        verified: verified,
+        room: "",
+        lastSeen: millis()
+    };
+    sessions[sizeof(sessions)] = s;
+    print("[auth] " + provider + " sign-in: " + name + " (" + s.sid + ")\n");
+    return s;
+}
+
+function publicMe(s) {
+    return {sid: s.sid, name: s.name, provider: s.provider, email: s.email, verified: s.verified, room: s.room};
+}
+
+function cleanName(n) {
+    if (sizeof(n) == 0) {
+        return "Anonymous";
+    }
+    if (sizeof(n) > 60) {
+        return substr(n, 0, 60);
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- rooms & messages
+function pushMessage(room, from, name, type, data) {
+    seq = seq + 1;
+    messages[sizeof(messages)] = {seq: seq, room: room, from: from, name: name, type: type, data: data, t: millis()};
+    if (sizeof(messages) > MAX_MESSAGES) {
+        var keep = [];
+        for (var i = sizeof(messages) - int(MAX_MESSAGES / 2); i < sizeof(messages); i = i + 1) {
+            keep[sizeof(keep)] = messages[i];
+        }
+        messages = keep;
+    }
+}
+
+function roomPeers(room) {
+    var list = [];
+    for (var i = 0; i < sizeof(sessions); i = i + 1) {
+        if (sessions[i].room == room) {
+            list[sizeof(list)] = {sid: sessions[i].sid, name: sessions[i].name, provider: sessions[i].provider};
+        }
+    }
+    return list;
+}
+
+function leaveRoom(s, reason) {
+    if (sizeof(s.room) > 0) {
+        print("[room] " + s.name + " left '" + s.room + "' (" + reason + ")\n");
+        pushMessage(s.room, s.sid, s.name, "leave", reason);
+        s.room = "";
+    }
+}
+
+function sweep() {
+    var now = millis();
+    for (var i = 0; i < sizeof(sessions); i = i + 1) {
+        if (sizeof(sessions[i].room) > 0) {
+            if (now - sessions[i].lastSeen > PEER_TIMEOUT_MS) {
+                leaveRoom(sessions[i], "timeout");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- request body
+function seenNonce(n) {
+    for (var i = 0; i < sizeof(recentNonces); i = i + 1) {
+        if (recentNonces[i] == n) {
+            return 1;
+        }
+    }
+    recentNonces[sizeof(recentNonces)] = n;
+    if (sizeof(recentNonces) > 400) {
+        var keep = [];
+        for (var j = 200; j < sizeof(recentNonces); j = j + 1) {
+            keep[sizeof(keep)] = recentNonces[j];
+        }
+        recentNonces = keep;
+    }
+    return 0;
+}
+
+function tryBody(s, nonce) {
+    var n = sizeof(s);
+    if (n < 2) {
+        return null;
+    }
+    if (s[0] != "{" || s[n - 1] != "}") {
+        return null;
+    }
+    var o = parseJSON(s);
+    if (isObject(o) == 0) {
+        return null;
+    }
+    if (o.nonce == nonce) {
+        return o;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------- auth providers
+function b64urlDecode(s) {
+    var out = "";
+    for (var i = 0; i < sizeof(s); i = i + 1) {
+        var ch = s[i];
+        if (ch == "-") {
+            ch = "+";
+        } else if (ch == "_") {
+            ch = "/";
+        }
+        out = out + ch;
+    }
+    while (sizeof(out) % 4 != 0) {
+        out = out + "=";
+    }
+    return b64.decode(out);
+}
+
+function googleSignIn(c, body) {
+    var cid = CONFIG.googleClientId;
+    if (sizeof(cid) == 0) {
+        fail(c, "503 Service Unavailable", "Google client ID is not set in config.json");
+        return;
+    }
+    var jwt = body.credential;
+    if (sizeof(jwt) < 20 || sizeof(jwt) > 3800) {
+        fail(c, "400 Bad Request", "missing Google credential");
+        return;
+    }
+    var d1 = indexOf(jwt, ".", 0);
+    var d2 = indexOf(jwt, ".", d1 + 1);
+    if (d1 < 0 || d2 < 0) {
+        fail(c, "400 Bad Request", "malformed Google credential");
+        return;
+    }
+    var payloadText = b64urlDecode(substr(jwt, d1 + 1, d2 - d1 - 1));
+    var p = parseJSON(payloadText);
+    if (isObject(p) == 0) {
+        fail(c, "400 Bad Request", "unreadable Google credential");
+        return;
+    }
+    // Claim checks only. The RS256 signature is NOT verified: strict BSL has no
+    // RSA and no HTTPS client to fetch Google's keys (see GAPS.md).
+    if (p.aud != cid) {
+        fail(c, "401 Unauthorized", "token audience does not match this app");
+        return;
+    }
+    if (p.iss != "accounts.google.com" && p.iss != "https://accounts.google.com") {
+        fail(c, "401 Unauthorized", "token issuer is not Google");
+        return;
+    }
+    if (p.exp < clock.now()) {
+        fail(c, "401 Unauthorized", "Google token expired");
+        return;
+    }
+    var name = p.email;
+    if (p.name != 0) {
+        name = p.name;
+    }
+    var s = createSession("google", cleanName(name), p.email, 0);
+    json(c, "200 OK", {ok: 1, token: s.token, me: publicMe(s)});
+}
+
+function facebookSignIn(c, body) {
+    if (sizeof(CONFIG.facebookAppId) == 0) {
+        fail(c, "503 Service Unavailable", "Facebook app ID is not set in config.json");
+        return;
+    }
+    if (sizeof(body.accessToken) < 10 || sizeof(body.userID) < 3) {
+        fail(c, "400 Bad Request", "missing Facebook login data");
+        return;
+    }
+    // The access token cannot be checked against graph.facebook.com: no HTTPS
+    // client in strict BSL. The name is trusted as sent (see GAPS.md).
+    var s = createSession("facebook", cleanName(body.name), "", 0);
+    json(c, "200 OK", {ok: 1, token: s.token, me: publicMe(s)});
+}
+
+function devSignIn(c, body) {
+    if (CONFIG.devLogin != 1) {
+        fail(c, "403 Forbidden", "dev login is disabled");
+        return;
+    }
+    var s = createSession("dev", cleanName(body.name), "", 0);
+    json(c, "200 OK", {ok: 1, token: s.token, me: publicMe(s)});
+}
+
+// ---------------------------------------------------------------- room endpoints
+function joinRoom(c, s, body) {
+    var room = body.room;
+    if (validRoom(room) == 0) {
+        fail(c, "400 Bad Request", "room must be 1-32 letters, digits, - or _");
+        return;
+    }
+    if (s.room == room) {
+        json(c, "200 OK", {ok: 1, me: publicMe(s), peers: roomPeers(room), since: seq});
+        return;
+    }
+    leaveRoom(s, "switched room");
+    sweep();
+    if (sizeof(roomPeers(room)) >= MAX_ROOM_SIZE) {
+        fail(c, "409 Conflict", "room is full (1:1 calls only)");
+        return;
+    }
+    var since = seq;
+    s.room = room;
+    s.lastSeen = millis();
+    pushMessage(room, s.sid, s.name, "join", "");
+    print("[room] " + s.name + " joined '" + room + "'\n");
+    json(c, "200 OK", {ok: 1, me: publicMe(s), peers: roomPeers(room), since: since});
+}
+
+function sendMessage(c, s, body) {
+    if (sizeof(s.room) == 0 || body.room != s.room) {
+        fail(c, "403 Forbidden", "join the room first");
+        return;
+    }
+    var type = body.type;
+    if (type == "chat") {
+        var text = body.data;
+        if (sizeof(text) == 0 || sizeof(text) > 2000) {
+            fail(c, "400 Bad Request", "chat text must be 1-2000 bytes");
+            return;
+        }
+        pushMessage(s.room, s.sid, s.name, "chat", text);
+    } else if (type == "signal") {
+        pushMessage(s.room, s.sid, s.name, "signal", body.data);
+    } else {
+        fail(c, "400 Bad Request", "unknown message type");
+        return;
+    }
+    s.lastSeen = millis();
+    json(c, "200 OK", {ok: 1, seq: seq});
+}
+
+function poll(c, s, path) {
+    var room = queryParam(path, "room");
+    if (sizeof(s.room) == 0 || room != s.room) {
+        fail(c, "403 Forbidden", "not in this room");
+        return;
+    }
+    s.lastSeen = millis();
+    sweep();
+    var since = parseInt(queryParam(path, "since"));
+    var out = [];
+    for (var i = 0; i < sizeof(messages); i = i + 1) {
+        var m = messages[i];
+        if (m.seq > since && m.room == room && m.from != s.sid) {
+            if (sizeof(out) < 60) {
+                out[sizeof(out)] = m;
+            }
+        }
+    }
+    var last = seq;
+    if (sizeof(out) == 60) {
+        last = out[59].seq;
+    }
+    json(c, "200 OK", {ok: 1, seq: last, messages: out, peers: roomPeers(room)});
+}
+
+// ---------------------------------------------------------------- router
+function handle(c) {
+    var d = socket_read(c, 65536);
+    if (sizeof(d) < 14) {
+        return;
+    }
+    var he = indexOf(d, "\r\n\r\n", 0);
+    if (he < 0 || he > 16000) {
+        fail(c, "400 Bad Request", "bad request");
+        return;
+    }
+    var head = substr(d, 0, he + 2);
+    var sp1 = indexOf(head, " ", 0);
+    var sp2 = indexOf(head, " ", sp1 + 1);
+    if (sp1 < 0 || sp2 < 0) {
+        fail(c, "400 Bad Request", "bad request line");
+        return;
+    }
+    var method = substr(head, 0, sp1);
+    var path = substr(head, sp1 + 1, sp2 - sp1 - 1);
+    var route = path;
+    var qpos = indexOf(path, "?", 0);
+    if (qpos >= 0) {
+        route = substr(path, 0, qpos);
+    }
+
+    // ---- static files and public endpoints
+    if (method == "GET") {
+        if (route == "/" || route == "/index.html") {
+            serveFile(c, "public/index.html", "text/html; charset=utf-8");
+        } else if (route == "/app.js") {
+            serveFile(c, "public/app.js", "text/javascript; charset=utf-8");
+        } else if (route == "/style.css") {
+            serveFile(c, "public/style.css", "text/css; charset=utf-8");
+        } else if (route == "/config") {
+            json(c, "200 OK", {
+                googleClientId: CONFIG.googleClientId,
+                facebookAppId: CONFIG.facebookAppId,
+                githubAvailable: 0,
+                devLogin: CONFIG.devLogin
+            });
+        } else if (route == "/auth/github") {
+            respond(c, "501 Not Implemented", "text/plain; charset=utf-8",
+                "GitHub sign-in is not available in strict BSL: the OAuth code exchange needs an HTTPS client and the client secret on the server. See GAPS.md.");
+        } else if (route == "/me") {
+            var sm = authSession(head);
+            if (isObject(sm) == 0) {
+                fail(c, "401 Unauthorized", "not signed in");
+            } else {
+                json(c, "200 OK", {ok: 1, me: publicMe(sm)});
+            }
+        } else if (route == "/poll") {
+            var sp = authSession(head);
+            if (isObject(sp) == 0) {
+                fail(c, "401 Unauthorized", "not signed in");
+            } else {
+                poll(c, sp, path);
+            }
+        } else if (route == "/favicon.ico") {
+            respond(c, "204 No Content", "text/plain", "");
+        } else {
+            respond(c, "404 Not Found", "text/plain; charset=utf-8", "Not found");
+        }
+        return;
+    }
+
+    if (method != "POST") {
+        respond(c, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed");
+        return;
+    }
+
+    // ---- POST: read and validate the JSON body
+    var cl = parseInt(getHeader(head, "Content-Length", "content-length"));
+    if (cl <= 0 || cl > MAX_BODY) {
+        fail(c, "413 Payload Too Large", "body must be 1-" + MAX_BODY + " bytes");
+        return;
+    }
+    var nonce = getHeader(head, "X-Nonce", "x-nonce");
+    if (sizeof(nonce) < 8 || sizeof(nonce) > 40) {
+        fail(c, "400 Bad Request", "missing X-Nonce header");
+        return;
+    }
+    var body = tryBody(substr(d, he + 4, cl), nonce);
+    if (isObject(body) == 0) {
+        // The body arrived in a second TCP segment: read once more.
+        var d2 = socket_read(c, 65536);
+        body = tryBody(substr(d2, 0, cl), nonce);
+    }
+    if (isObject(body) == 0) {
+        fail(c, "400 Bad Request", "body missing or does not match X-Nonce");
+        return;
+    }
+    if (seenNonce(nonce) == 1) {
+        fail(c, "409 Conflict", "duplicate request");
+        return;
+    }
+
+    if (route == "/auth/google") {
+        googleSignIn(c, body);
+        return;
+    }
+    if (route == "/auth/facebook") {
+        facebookSignIn(c, body);
+        return;
+    }
+    if (route == "/auth/dev") {
+        devSignIn(c, body);
+        return;
+    }
+
+    var s = authSession(head);
+    if (isObject(s) == 0) {
+        fail(c, "401 Unauthorized", "not signed in");
+        return;
+    }
+    if (route == "/join") {
+        joinRoom(c, s, body);
+    } else if (route == "/send") {
+        sendMessage(c, s, body);
+    } else if (route == "/leave") {
+        leaveRoom(s, "hang up");
+        json(c, "200 OK", {ok: 1});
+    } else if (route == "/logout") {
+        leaveRoom(s, "signed out");
+        s.token = "x";
+        json(c, "200 OK", {ok: 1});
+    } else {
+        fail(c, "404 Not Found", "unknown endpoint");
+    }
+}
+
+// ---------------------------------------------------------------- main loop
+if (socket_init() < 0) {
+    print("socket_init failed\n");
+    exit(1);
+}
+var server = socket_create();
+if (socket_bind(server, 0, PORT) < 0) {
+    print("Could not bind port " + PORT + ". Is another server running?\n");
+    exit(1);
+}
+socket_listen(server, 32);
+print("Lab 3 server running on http://localhost:" + PORT + "/\n");
+if (CONFIG.devLogin == 1) {
+    print("WARNING: devLogin is enabled in config.json (local testing only).\n");
+}
+
+while (1) {
+    var client = socket_accept(server);
+    if (client >= 0) {
+        handle(client);
+        socket_close(client);
+    }
+}
